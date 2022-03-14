@@ -1,0 +1,1426 @@
+#!/bin/bash
+#
+# File:         run_sfpcpos_parallel.shl
+# Created:      12-JUL-2019
+# Purpose:      Run the CPOS Processor (SFPCPOS) program for for the nightly job. Distributes
+#               all of the students for batch processing among the pop-selections to allow for 
+#               concurrent executions.
+#
+# -------------------------------------------------------------------------------------------------
+#  Run as a batch runner user
+#
+#  Spec:
+#    1. $UH_HOME is where we store all of our scripts that UH has authored instead of the jobsub
+#       user's bin and home directories.
+#    2. $UH_HOME/etc/pw.conf - password file for this script
+#       NOTE: The case of the user name must match between this script and its password file.
+#    3. Assumes that setsid was used to set the run time environment variables.
+#    4. Change to the $UH_HOME/bin directory before running the CPOS  processor program so that 
+#       the script sources all needed files. Script will create the ".lis" file in the 
+#       $JOB_HOME directory.
+#
+#
+#  Dependencies:
+#    1. $UH_HOME/bin/get_creds.sh 
+#    2. $ORACLE_BASE/lbin/setsid
+#
+# -------------------------------------------------------------------------------------------------
+#  Usage:
+#
+#  $UH_HOME/bin/run_sfpcpos_parallel.shl SID CONFIG > LOG 2>&1
+#
+#  Where:
+#       SID     : Which environment to run in
+#       CONFIG  : Which configuration file to use
+#  Ex:
+#       run_sfpcpos_parallel.shl bandev sfpcpos_controls_manoa.cfg
+#       run_sfpcpos_parallel.shl bandev sfpcpos_controls_all.cfg
+#
+#--------------------------------------------------------------------------------------------------
+#
+# Audit Log 1.0
+#
+#    1. Initial release of the script.                                              KAH 12-JUL-2019
+#    2. Revised script for eCommunities posting.                                        11-MAR-2022
+#
+# Audit Log End
+#
+# -------------------------------------------------------------------------------------------------
+#
+# Logic outline:
+#
+#   Verify working environment:
+#       Verify script inputs
+#       Verify configuration parameter
+#       Verify SID passed parameter
+#       Verify environment after setsid is called
+#       Verify required directories
+#       Verify required files
+#
+#   Load configuration values and ensure required ones are present
+#   Generate logging folders for run
+#   Clean out previous runs TEMP folder location
+#
+#   Check database configurations
+#       LOOP for all colleges
+#           Get DB creds for college
+#           Test database connection for each
+#       END LOOP
+#
+#   Preserve Overrides
+#       LOOP for all colleges
+#           run sfkscre.p_preserve_overrides for each college
+#           Ouput results to its own log file
+#       END LOOP
+#
+#   LOOP for all colleges
+#       Read configuration from array for population selection information
+#           get Application, Creator ID, User ID, Selection Prefix, and Number of Batches to do
+#       For each college, set up the population selections for the college by calling
+#       SFKSCRE.p_load_popsels for college and distribute students amongst batches
+#
+#       LOOP
+#           Queue up the batch of jobs for the college
+#               Get ONEUP number
+#               Insert JOBSUB parameters
+#               Add ONEUP to array of JOBSUB numbers
+#               Add ONEUP to array of JOBSUB details
+#       END LOOP
+#   END LOOP
+#
+#   If no errors, schedule all jobs, else exit out.
+#
+#   WHILE LOOP until all jobs are scheduled
+#       Count how many SFPCPOS processors are running
+#       Determine how many processors to spin up
+#       LOOP through array of ONEUP numbers to kick off to MAX_PARRAELL
+#           Generate a credential file to keep dbcreds out of the PS command.
+#           Kick off SFPCPOS processor for every JOBSUB that has been setup
+#       END LOOP
+#
+#       See if all jobs are completed, else, sleep for MAX_SLEEP
+#
+#   END LOOP
+#
+#   WHILE LOOP until last batch of processors are completed
+#       Count via PGREP of SFPCPOS processors running
+#       If none are, exit out, else sleep for MAX_SLEEP
+#   DONE
+#
+# -------------------------------------------------------------------------------------------------
+#
+
+
+StartTime=`date`
+#
+# Set the umask to this so all folders and files created by this script will not be
+# accessible to other users.
+umask 0022
+
+# Enable/disable debug mode
+#DEBUG_MODE="OFF"
+DEBUG_MODE="ON"
+
+SEPBAR="======================================================================"
+
+echo "${SEPBAR}"
+echo "Starting ${0} for ${1} using ${2} at: ${StartTime}"
+echo " "
+
+#
+# Parameter checks ------------------------------------------------------------
+#
+
+if [ $# -lt 1 ] && [ $# -gt 2 ] ; then
+    echo " "
+    echo "Usage: ${0} SID CONFIG"
+    echo " "
+    echo "Where:"
+    echo "     SID    : Which environment to run under"
+    echo "     CONFIG : Which configuration file to use"
+    echo "Ex:"
+    echo "     run_sfpcpos_parallel.shl bandev sfpcpos_controls_all.cfg"
+    echo "     run_sfpcpos_parallel.shl bandev sfpcpos_controls_manonly.cfg"
+    echo "     run_sfpcpos_parallel.shl bandev sfpcpos_controls_allothers.cfg"
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+if [ "${1}" = "" ]; then
+    echo " "
+    echo "  ERROR: Database SID is not set."
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+if [ "${2}" = "" ]; then
+    echo " "
+    echo "  ERROR: Configuration files is not set."
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+#
+# Setup Environment -----------------------------------------------------------
+#
+
+#
+# Validate the sid, only continue processing if the sid is found
+# in the /etc/oratab table. Only production environment is capitalized,
+# all others are lower case.
+#
+tmpsid=`grep "^${1}:" /etc/oratab`
+if [[ "$tmpsid" == "" ]] ; then
+    echo " "
+    echo " ERROR: Invalid SID given: -${1}-"
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+else
+    echo " Valid SID given"
+fi
+
+#
+# Setup basic path to set sid
+PATH=/usr/local/banner/bin:/bin:/usr/bin:/usr/local/bin:/usr/sbin/:${HOME}/bin
+export PATH=/oracle/lbin:${PATH}
+. /oracle/lbin/setsid "${1}"
+
+if [[ "${UH_HOME}" == "" ]]; then
+    echo " "
+    echo "UH_HOME is not set.  Run setsid for your database environment."
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+#
+# Verify Environment ----------------------------------------------------------
+#
+
+if [ "${UH_HOME}" = "" ]; then
+    echo " "
+    echo " *** ERROR *** : UH_HOME is not set.  Run setsid for your database environment."
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+if [ "${JOB_HOME}" = "" ]; then
+    echo " "
+    echo " *** ERROR *** : JOB_HOME is not set.  Run setsid for your database environment."
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+#
+# Directory setups
+#
+RUN_DIR="${JOB_HOME}/automated/sfpcpos"
+LOGHOME="${RUN_DIR}/logs"
+TEMPHOME="${RUN_DIR}/temp"
+
+# Test if log directory exists
+if ! [ -d "${LOGHOME}" ]; then
+    echo " "
+    echo " ERROR: ${LOGHOME} does not exist. Exiting"
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+# Test if temp directory exists
+if ! [ -d "${TEMPHOME}" ]; then
+    echo " "
+    echo " ERROR: ${TEMPHOME} does not exist. Exiting"
+    echo " "
+    echo " "
+    echo "${SEPBAR}"
+    echo " "
+    exit 1
+fi
+
+echo " Required directories exist"
+echo " "
+
+
+#
+# Find required files
+#
+CMDFILE="sfpcpos_nightly.shl"
+CMDFILELOC="${BANNER_LINKS}/${CMDFILE}"
+CREDFILE="${UH_HOME}/etc/pw.conf"
+CONFIG="${UH_HOME}/etc/${2}"
+
+
+if ! [ -f "${CMDFILELOC}" ]; then
+    echo " "
+    echo " ERROR: ${CMDFILELOC} does not exist. Exiting"
+    echo " "
+    exit 1
+fi
+
+if ! [ -f "${CONFIG}" ]; then
+    echo " "
+    echo " ERROR: ${CONFIG} does not exist. Exiting"
+    echo " "
+    exit 1
+fi
+
+if ! [ -f "${CREDFILE}" ]; then
+    echo " "
+    echo " ERROR: ${CREDFILE} does not exist. Exiting"
+    echo " "
+    exit 1
+fi
+
+#
+# Variables -------------------------------------------------------------------
+#
+
+
+# Error holder flags
+ERROR_DB_CREDS="N"
+ERROR_DB_CONN="N"
+ERROR_MISC="N"
+
+# Array containers for processing
+declare -a collegeCtrl
+declare -A popSelCtrls
+declare -A emailsCtrls
+declare -a jobsToRun
+declare -A JobsDetails
+declare -a jobSubPids
+
+MAX_PARALLEL=""
+SLEEP_TIME=""
+COLLEGE=""
+
+#
+# Export all variables for sub shells
+#
+export RUN_DIR
+export LOGHOME
+export TEMPHOME
+export CMDFILE
+export CMDFILELOC
+export CREDFILE
+export CONFIG
+#
+export collegeCtrl
+export popSelCtrls
+export emailsCtrls
+export jobsToRun
+export JobsDetails
+export jobSubPids
+export MAX_PARALLEL
+export SLEEP_TIME
+export COLLEGE
+
+
+#
+# Load configuration array containers
+#
+echo " "
+echo "   Loading configurations from ${CONFIG}..."
+source "${CONFIG}"
+
+
+if [ "$DEBUG_MODE" = "ON" ] ; then
+
+    echo " "
+    echo "  Configs used:"
+    echo "  "
+    echo "    collegeCtrl  : ${#collegeCtrl[@]}"
+    for i in ${collegeCtrl[@]}; do
+    echo "                       ${i}"    
+    done
+    echo "    popSelCtrls  : ${#popSelCtrls[@]}"
+    for i in ${popSelCtrls[@]}; do
+    echo "                       ${i}"    
+    done
+    echo "    emailsCtrls  : ${#emailsCtrls[@]}"
+    for i in ${emailsCtrls[@]}; do
+    echo "                       ${i}"    
+    done
+    echo "    jobsToRun    : ${#jobsToRun[@]}"
+    for i in ${jobsToRun[@]}; do
+    echo "                       ${i}"    
+    done
+    echo "    JobsDetails  : ${#JobsDetails[@]}"
+    for i in ${JobsDetails[@]}; do
+    echo "                       ${i}"    
+    done
+    echo "  "
+    echo "    MAX_PARALLEL : ${MAX_PARALLEL}"
+    echo "    SLEEP_TIME   : ${SLEEP_TIME}"
+    echo "    COLLEGE      : ${COLLEGE}"
+    echo " "
+
+fi
+
+#
+# Do configuration checks
+#
+echo "   Validating runtime configurations..."
+if [ -z "${collegeCtrl}" ] || [ ${#collegeCtrl[@]} -lt 1 ]  ; then
+    echo " "
+    echo " ERROR: Configuration college list not populated"
+    echo " "
+    exit 1
+fi
+
+if [ ${#popSelCtrls[@]} -lt 1 ] ; then
+    echo " "
+    echo " ERROR: Configuration population selection list not populated"
+    echo " "
+    exit 1
+fi
+
+if [ ${#emailsCtrls[@]} -lt 1 ] ; then
+    echo " "
+    echo " ERROR: Configuration email list not populated"
+    echo " "
+    exit 1
+fi
+
+if [[ "${MAX_PARALLEL}" == "" ]]; then
+    echo " "
+    echo " ERROR: Configuration MAX_PARALLEL is not populated"
+    echo " "
+    exit 1
+fi
+
+if [[ "${SLEEP_TIME}" == "" ]]; then
+    echo " "
+    echo " ERROR: Configuration SLEEP_TIME is not populated"
+    echo " "
+    exit 1
+fi
+
+
+# Generate log, error file, and directory if needed. Formats are:
+#     $UH_HOME/logs/YYYY/MM/DD/cpos_YYYYMMDD-HHMMSS.log
+#     $UH_HOME/logs/YYYY/MM/DD/cpos_YYYYMMDD-HHMMSS.err
+logdir="${LOGHOME}/"`date +%Y/%m/%d/%H%M`
+#echo "LOGHOME  : ${LOGHOME}"
+#echo "logdir   : ${logdir}"
+
+if ! [ -d "${logdir}" ] ; then
+    echo "making ${logdir}";
+    mkdir -vp "${logdir}"
+fi
+
+# Set up logging prefix for all subsequent logs
+logdate=`date +%Y%m%d-%H%M%S`
+LOG_PREFIX="${logdir}/cpos_${logdate}"
+ERR_PREFIX="${logdir}/cpos_${logdate}"
+LOG="${LOG_PREFIX}_main.log"
+ERR="${ERR_PREFIX}_main.err"
+
+#
+# Start Logging for the run ---------------------------------------------------
+#
+
+
+echo "Log information at:"
+echo "   ${LOG}"
+echo "   ${ERR}"
+echo " "
+
+echo "${SEPBAR}"                                                                     >  "${LOG}" 2>  "${ERR}"
+echo "Starting ${0} for ${1} using ${2} at: ${StartTime}"                            >> "${LOG}" 2>> "${ERR}"
+echo "Log information at:"                                                           >> "${LOG}" 2>> "${ERR}"
+echo "   ${LOG}"                                                                     >> "${LOG}" 2>> "${ERR}"
+echo "   ${ERR}"                                                                     >> "${LOG}" 2>> "${ERR}"
+echo " "                                                                             >> "${LOG}" 2>> "${ERR}"
+
+
+#
+# Functions ----------------------------------------------------------
+#
+
+#---------------------------------------------------------------------
+#
+# Joins any values passed into it with the delimiter specified
+#
+#    Parameters:
+#      1     - Delimitation to use
+#      2..N  - List of things to append separated by spaces
+#
+function join_by { local d=${1}; shift; echo -n "${1}"; shift; printf "%s" "${@/#/$d}"; }
+
+#---------------------------------------------------------------------
+#
+# Cleans up temp files
+#
+function doCleanWorkArea () {
+    echo " "
+    echo "  Cleaning up temp directories..."
+    echo " "
+    cd "${TEMPHOME}"
+    rm -rv *
+    echo " "
+    echo " Done with clean ups..."
+    echo " "
+}
+
+#---------------------------------------------------------------------
+#
+# Check that DB is up and all database users exist in credentials file
+#
+function doCheckDB()
+{
+    echo "Testing database connection"
+    local DB_USER
+    local DB_PASS
+    local errorText
+    local TestConnection
+    local plsqlstring
+    local SQLResult
+
+    echo "Checking for all user credentials"
+
+    for aCol in ${collegeCtrl[@]}; do
+
+        # Replace with pattern for your accounts that are to run SFPCPOS
+        DB_USER=`echo "${aCol}_faload" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+
+        # get credentials - script that we use to get passwords from vault
+        DB_PASS=`get_creds.sh ${DB_USER} ${ORACLE_SID} ${CREDFILE}`
+
+        if [ "${DB_PASS}" = "" ]; then
+            echo "Password not found for user ${DB_USER} in ${ORACLE_SID}. Contact a DBA or SA about the account credentials."
+            ERROR_DB_CREDS="Y"
+            return 1
+        fi
+        echo "     ${aCol}/${DB_USER} -- PASS" 
+
+    done
+
+#
+# Check if database is up and can log in using last user obtained
+#
+    echo "Testing database connection"
+    TestConnection="NOTUP"
+    SQLResult="${TEMPHOME}/dbtestresult_main.out"
+sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+SET VERIFY OFF;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+SET LINESIZE 100;
+SET PAGESIZE 0;
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 2;
+SELECT 'connection_established' FROM dual;
+EXIT;
+DBCMDS
+
+    TestConnection=`cat "${SQLResult}"`
+
+
+    if [ "$DEBUG_MODE" = "ON" ] ; then
+        echo " Test connection is: "${TestConnection}
+    fi
+
+    if [ "${TestConnection}" = "connection_established" ] ; then
+      echo "  Database is up and operational."
+    else
+      echo "  Database is DOWN!"
+#      errorText="Database is down! Could not connect with $DB_USER"
+#     mailFunctionalsError "ALL INSTITUTIONS" "$errorText"
+      ERROR_DB_CONN="Y"
+      return 1
+    fi
+}
+
+
+#---------------------------------------------------------------------
+#
+# Calls the packaged procedures to distribute the students amongst
+# the population selections specified in the configurations.
+#
+#---------------------------------------------------------------------
+#
+#  References globals:
+#
+#       GV_APPLICATION
+#       GV_SELECTION_PREFIX
+#       GV_CREATOR_ID
+#       GV_USER_ID
+#       GV_VPDI_CODE
+#       GV_BATCHES
+#       DB_USER
+#       DB_PASS
+#
+#---------------------------------------------------------------------
+#
+function populateCollegeSelections() {
+
+    local SQLResult="${TEMPHOME}/${GV_VPDI_CODE}.populateSelections.out"
+    local retval=""
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "populateCollegeSelections START"
+        echo "  Using Values:"
+        echo "    DB_USER              : ${DB_USER}"
+        echo "    DB_PASS              : --DB_PASS--"
+        echo "    GV_APPLICATION       : ${GV_APPLICATION}"
+        echo "    GV_SELECTION_PREFIX  : ${GV_SELECTION_PREFIX}"
+        echo "    GV_CREATOR_ID        : ${GV_CREATOR_ID}"
+        echo "    GV_USER_ID           : ${GV_USER_ID}"
+        echo "    GV_VPDI_CODE         : ${GV_VPDI_CODE}"
+        echo "    GV_BATCHES           : ${GV_BATCHES}"
+        echo " "
+    fi
+
+sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+SET VERIFY OFF;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+SET LINESIZE 100;
+SET PAGESIZE 0;
+SET SERVEROUT ON;
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 2;
+BEGIN
+  dbms_output.enable(null);
+  sfkscre.p_load_popsels(p_application      => '${GV_APPLICATION}',
+                         p_selection_prefix => '${GV_SELECTION_PREFIX}',
+                         p_creator_id       => '${GV_CREATOR_ID}',
+                         p_user_id          => '${GV_USER_ID}',
+                         p_vpdi_code        => '${GV_VPDI_CODE}',
+                         p_batches          =>  ${GV_BATCHES});
+END;
+/
+EXIT;
+DBCMDS
+    retval=$?
+
+    cat  "${SQLResult}"
+
+    if [[ ${retval} != "0" ]]; then
+        echo " "
+        echo " ERROR: Unable to distribute students amongst population selections"
+        echo " "
+        echo " "
+        ERROR_MISC=Y
+        return 3
+    fi
+}
+
+
+
+#---------------------------------------------------------------------
+#
+#  Generate oneup number, exits out if cannot generate one
+#
+function generateJobSubNumber() {
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "generateJobSubNumber START"
+    fi
+
+    local numb
+    local SQLResult="${TEMPHOME}/${GV_VPDI_CODE}.genJobSub.out"
+    local SQLOneUpNum="${TEMPHOME}/${GV_VPDI_CODE}.genJobSubNumber.out"
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "Removing previous files"
+    fi
+    if [[ -f "${SQLResult}" ]]; then
+        rm -v "${SQLResult}"
+    fi
+
+    if [[ -f "${SQLOneUpNum}" ]]; then
+        rm -v "${SQLOneUpNum}"
+    fi
+    
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "Calling with:"
+        echo "  SQLResult    : ${SQLResult}"
+        echo "  SQLOneUpNum  : ${SQLOneUpNum}"
+        echo " "
+    fi
+
+    sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+SET FEEDBACK OFF
+SET VERIFY OFF
+SET HEAD OFF
+SET NEWPAGE NONE
+SPOOL ${SQLOneUpNum} create
+SELECT TRIM(gjbpseq.nextval) FROM dual;
+SPOOL OFF
+SET ECHO OFF
+SET TERMOUT OFF
+EXIT;
+DBCMDS
+    if [[ $? != "0" ]]; then
+        echo " "
+        echo " ERROR: Unable to get one up number"
+        echo " "
+        cat  "${SQLResult}"
+        echo " "
+        ERROR_MISC=Y
+        return 3
+    fi
+
+    numb=`cat "${SQLOneUpNum}"`
+    ONEUP=`echo "${numb}" | sed 's/^ *//;s/ *$//'`   
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo " "
+        echo "  numb        : ${numb}"
+        echo "  ONEUP       : ${ONEUP}"
+        echo " "
+    fi
+
+}
+
+#---------------------------------------------------------------------
+#
+#  Inserts all of the JOBSUB variables for the run into GJBPRUN
+#
+function generateJobSub() {
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "generateJobSub start"
+    fi
+
+    local SQLResult="${TEMPHOME}/${GV_VPDI_CODE}.genJobSub.out"
+
+    # Generate the SQL statement
+    local SQLCMDS="SET VERIFY OFF;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+SET LINESIZE 1000;
+SET PAGESIZE 0;
+SET SERVEROUT ON;
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 2;
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '01', SYSDATE, 'P');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '02', SYSDATE, '${GV_APPLICATION}');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '03', SYSDATE, '${GV_POPSEL}');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '04', SYSDATE, '${GV_CREATOR_ID}');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '05', SYSDATE, '${GV_USER_ID}');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '06', SYSDATE, NULL);
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '07', SYSDATE, 'N');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '08', SYSDATE, '60');
+--
+INSERT INTO gjbprun (gjbprun_job, gjbprun_one_up_no, gjbprun_number, gjbprun_activity_date, gjbprun_value)
+             VALUES ('SFPCPOS', ${ONEUP}, '09', SYSDATE, 'N');
+--
+COMMIT;
+--
+EXIT;"
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo " SQLResult   : ${SQLResult}"
+        echo " SQLCMDS     : "
+        echo "-----------------------------------------"
+        echo "${SQLCMDS}"
+        echo "-----------------------------------------"
+        echo " "
+    fi
+
+    # Execute the generated SQL statement
+    sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+${SQLCMDS}
+DBCMDS
+    if [[ $? != "0" ]]; then
+        echo " "
+        echo " ERROR: Unable to insert parameters for ONEUP ${ONEUP}"
+        echo " "
+        cat  "${SQLResult}"
+        echo " "
+        ERROR_MISC=Y
+        return 3
+    fi
+
+}
+
+#---------------------------------------------------------------------
+#
+#  Inserts a SFPCPOS JOBSUB set of parameters into the database and
+#  upon successful insert, will add the job to the queue.
+#
+#  Parameters:
+#
+#    1 - College            - Used for log name generation
+#    2 - Application ID     - Popsel key
+#    3 - Selection name     - Popsel key
+#    4 - Creator ID         - Popsel key
+#    5 - User ID            - Popsel key
+#
+#  Once the job is controls are inserted, will add the following
+#  to the queue array:
+#
+#    1. Inserts ONEUP to the jobs to run array
+#    2. Inserts ONEUP info to the job details array
+#       1. College ONEUP is is for
+#       2. Execution log file location
+#       2. Jobsub lis file location
+#       3. Jobsub log file location
+#
+#---------------------------------------------------------------------
+#
+# Example parameters fed to the JOBSUB:
+#
+#    USERNAME                         : cpos_woa
+#    PASSWORD                         : xxxxx
+#    PARAMETER SEQUENCE NUMBER        : <NULL>
+#    RUN MODE                         : P
+#    SELECTION APPLICATION CODE       : FINWOA              ( 2 )
+#    SELECTION IDENTIFIER             : CPOS_BATCH_WOA_01   ( 3 )
+#    SELECTION CREATER ID             : FINWOA              ( 4 )
+#    SELECTION USER ID                : FINWOA              ( 5 )
+#    STUDENT ID                       : <NULL>
+#    RUN IN SLEEP/WAKE MODE (Y/[N])   : N
+#    SLEEP INTERVAL                   : 60
+#    ON DEMAND EVALUATION             : N
+#
+#---------------------------------------------------------------------
+#
+function queueJobSub() {
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "queueJobSub START"
+    fi
+
+    local EXEC_LOG="${LOG_PREFIX}_${1}_${3}_exe.log"
+    local TARGET_LIS="${LOG_PREFIX}_${1}_${3}.lis"
+    local TARGET_LOG="${LOG_PREFIX}_${1}_${3}.log"
+    local LOG4J_LOG="NOLOG4J"
+
+    if [ "$DEBUG_MODE" = "ON" ] ; then
+        LOG4J_LOG="${LOG_PREFIX}_${1}_${3}_LOG4J.log"
+        echo "Variables: "
+        echo "   sfpcpos.shl > ${EXEC_LOG}"
+        echo "   USERNAME                       :  ${DB_USER}"
+        echo "   PASSWORD                       :  --DB_PASS--"
+#       echo "   PARAMETER SEQUENCE NUMBER      :  <NULL>"
+        echo "   RUN MODE                       :  P"
+        echo "   SELECTION APPLICATION CODE     :  ${2}"
+        echo "   SELECTION IDENTIFIER           :  ${3}"
+        echo "   SELECTION CREATER ID           :  ${4}"
+        echo "   SELECTION USER ID              :  ${5}"
+        echo "   STUDENT ID                     :  <NULL>"
+        echo "   RUN IN SLEEP/WAKE MODE (Y/[N]) :  N"
+        echo "   SLEEP INTERVAL                 :  60"
+        echo "   ON DEMAND EVALUATION           :  N"
+    fi
+
+
+    echo " "
+    echo "    Get ONEUP Number"
+    echo " "
+    ONEUP=""
+    generateJobSubNumber
+
+    if [[ "${ONEUP}" -eq "" ]]; then
+        echo " "
+        echo " ERROR: Unable to get ONEUP"
+        echo " "
+        ERROR_MISC="Y"
+        return 2
+    fi
+
+
+    echo " "
+    echo "    Generating JobSub..."
+    echo " "
+    generateJobSub
+    if [[ $? != "0" ]]; then
+        ERROR_MISC=Y
+        return 3
+    fi
+
+    # Store the jobs and its details in arrays
+    jobsToRun+=("${ONEUP}")
+    JobsDetails["${ONEUP}"]="${COLLEGE}|${EXEC_LOG}|${TARGET_LIS}|${TARGET_LOG}|${LOG4J_LOG}"
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "   Added ONEUP ${ONEUP} to jobsToRun"
+        echo "   Added JobsDetails[${ONEUP}]: ${JobsDetails["${ONEUP}"]}"
+    fi
+}
+
+#---------------------------------------------------------------------
+#
+#  Clears variables and generates all needed variables for the nightly
+#  processing.
+#Starts a SFPCPOS job and sends it to work in the background 
+#  for the given parameters. Uses similar commands in "sfpcpos.shl" 
+#  to call the Java program.
+#
+#     1 -  JOBSUB ONE Up number
+#
+#
+function kickOffJob() {
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "kickOffJob START"
+    fi
+
+    
+
+    # Get the jobs information from array
+    local details=${JobsDetails["${1}"]}
+
+    # Populate run variables
+    local TARGET_COL=`echo "${details}" | cut -d'|' -f1`
+    local TARGET_COL_LOWER=`echo "${TARGET_COL}" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+    local TARGET_EXE=`echo "${details}" | cut -d'|' -f2`
+    local TARGET_LIS=`echo "${details}" | cut -d'|' -f3`
+    local TARGET_LOG=`echo "${details}" | cut -d'|' -f4`
+    local LOG4J_PATH=`echo "${details}" | cut -d'|' -f5`
+    
+    # Generate log directory date
+    local LOGDIR_COL="${JOB_HOME}/finaid/${TARGET_COL_LOWER}/sfpcpos/"`date +%Y%m%d`
+    
+    # Generate file credentials
+    local FILE_CREDS="${TEMPHOME}/${1}.creds"
+
+
+    # get credentials
+    local JOB_USER=`echo "${TARGET_COL}_faload" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+    local JOB_PASS=`get_creds.sh ${DB_USER} ${ORACLE_SID} ${CREDFILE}`
+
+    if [[ "${DEBUG_MODE}" == "ON" ]] ; then
+        echo "  Variables:"
+        echo "    details          : ${details}"
+        echo "    TARGET_COL       : ${TARGET_COL}"
+        echo "    TARGET_COL_LOWER : ${TARGET_COL_LOWER}"
+        echo "    TARGET_EXE       : ${TARGET_EXE}"
+        echo "    TARGET_LIS       : ${TARGET_LIS}"
+        echo "    TARGET_LOG       : ${TARGET_LOG}"
+        echo "    LOG4J_PATH       : ${LOG4J_PATH}"
+        echo "    LOGDIR_COL       : ${LOGDIR_COL}"
+        echo "    FILE_CREDS       : ${FILE_CREDS}"
+        echo "    JOB_USER         : ${JOB_USER}"
+        echo "    JOB_PASS         : --JOB_PASS--"
+    fi
+
+    # create credential files and restrict to JOB<SID> user
+    echo "" > "${FILE_CREDS}"
+    chmod 600 "${FILE_CREDS}"
+
+    echo "#!/bin/bash"                    >> "${FILE_CREDS}"
+    echo "ONE_UP=\"${1}\""                >> "${FILE_CREDS}"
+    echo "JOB_USER=\"${JOB_USER}\""       >> "${FILE_CREDS}"
+    echo "JOB_PASS=\"${JOB_PASS}\""       >> "${FILE_CREDS}"
+    echo "FILE_PATH=\"${LOGDIR_COL}\""    >> "${FILE_CREDS}"
+    echo "LOG4J_PATH=\"${LOG4J_PATH}\""   >> "${FILE_CREDS}"
+#   echo "TARGET_LIS=\"${TARGET_LIS}\""   >> "${FILE_CREDS}"
+#   echo "TARGET_LOG=\"${TARGET_LOG}\""   >> "${FILE_CREDS}"
+
+    if [[ ! -d "${LOGDIR_COL}" ]]; then
+        mkdir -vp "${LOGDIR_COL}" 
+    fi
+
+    echo "Starting SFPCPOS for ${TARGET_COL} - ${1} LOG: ${TARGET_EXE}"
+    echo "Starting SFPCPOS for ${TARGET_COL} - ${1} LOG: ${TARGET_EXE}" > "${TARGET_EXE}"
+
+    # Quick flag to either enable or disable running of the command for testing purposes.
+    if [[ 1 -eq 1 ]]; then
+     
+    ${CMDFILE} ${1} >> "${TARGET_EXE}" 2>&1 &
+    jobSubPids+=($!)    
+    else
+    echo "${CMDFILE} ${1} >> ${TARGET_EXE} 2>&1 &"
+    fi
+
+}
+
+
+#---------------------------------------------------------------------
+#
+#  Setups all of the SFPCPOS runs by reading the configuration files,
+#  generating oneup numbers, and inserting the GJBPRUN parameters for
+#  each configuration it encounters.
+#
+function doProcessSetup() {
+
+    if [ "$DEBUG_MODE" = "ON" ] ; then
+        echo "doProcessSetup START"
+    fi
+
+    local GV_APPLICATION=""
+    local GV_SELECTION_PREFIX=""
+    local GV_CREATOR_ID=""
+    local GV_USER_ID=""
+    local GV_VPDI_CODE=""
+    local GV_BATCHES=""
+    local GV_POPSEL=""
+
+    echo " "
+    echo "  Begin submission generation..."
+    echo " "
+
+    for aCol in ${collegeCtrl[@]}; do
+
+        echo "================================================================================"
+        echo " "
+        echo "   Start of processing for ${aCol}";
+        echo " "
+
+        COLLEGE="${aCol}"
+
+        echo " "
+        echo "  Clearing college variables..."
+        echo " "
+        GV_APPLICATION=""
+        GV_SELECTION_PREFIX=""
+        GV_CREATOR_ID=""
+        GV_USER_ID=""
+        GV_VPDI_CODE=""
+        GV_BATCHES=""
+        GV_POPSEL=""
+
+
+
+        # Get control values
+        GV_APPLICATION=`echo ${popSelCtrls["${COLLEGE}"]} | cut -d'|' -f1`
+        GV_SELECTION_PREFIX=`echo ${popSelCtrls["${COLLEGE}"]} | cut -d'|' -f2`
+        GV_CREATOR_ID=`echo ${popSelCtrls["${COLLEGE}"]} | cut -d'|' -f3`
+        GV_USER_ID=`echo ${popSelCtrls["${COLLEGE}"]} | cut -d'|' -f4`
+        GV_VPDI_CODE="${COLLEGE}"
+        GV_BATCHES=`echo ${popSelCtrls["${COLLEGE}"]} | cut -d'|' -f5`
+
+        # Get DB Creds
+        #DB_USER=`echo "CPOS_${COLLEGE}" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+        DB_USER=`echo "${COLLEGE}_faload" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+        DB_PASS=`get_creds.sh ${DB_USER} ${ORACLE_SID} ${CREDFILE}`
+
+        if [ "$DEBUG_MODE" = "ON" ] ; then
+            echo " COLLEGE              :  ${COLLEGE}"
+            echo " DB_USER              :  ${DB_USER}"
+            echo " DB_PASS              :  --DB_PASS--"
+            echo " GV_APPLICATION       :  ${GV_APPLICATION}"
+            echo " GV_SELECTION_PREFIX  :  ${GV_SELECTION_PREFIX}"
+            echo " GV_CREATOR_ID        :  ${GV_CREATOR_ID}"
+            echo " GV_USER_ID           :  ${GV_USER_ID}"
+            echo " GV_VPDI_CODE         :  ${GV_VPDI_CODE}"
+            echo " GV_BATCHES           :  ${GV_BATCHES}"
+            echo " GV_POPSEL            :  ${GV_POPSEL}"
+        fi
+
+        #
+        # Data checks
+        #
+        if [[ "${GV_APPLICATION}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_APPLICATION"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+        if [[ "${GV_SELECTION_PREFIX}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_SELECTION_PREFIX"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+        if [[ "${GV_CREATOR_ID}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_CREATOR_ID"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+        if [[ "${GV_USER_ID}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_USER_ID"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+        if [[ "${GV_VPDI_CODE}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_VPDI_CODE"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+        if [[ "${GV_BATCHES}" == "" ]]; then
+            echo " "
+            echo "  ERROR: Null value found for GV_BATCHES"
+            echo " "
+            ERROR_MISC="Y"
+            continue
+        fi
+
+#       if [[ "${GV_POPSEL}" == "" ]]; then
+#           echo " "
+#           echo "  ERROR: Null value found for GV_POPSEL"
+#           echo " "
+#           ERROR_MISC="Y"
+#           continue
+#       fi
+
+
+
+        echo " "
+        echo "    Populating college PopSels..."
+        echo " "
+        populateCollegeSelections
+        if [[ $? != "0" ]]; then
+            ERROR_MISC=Y
+            return 3
+        fi
+
+        echo " "
+        echo "    Queue jobs..."
+        echo " "
+
+        # Loop until all batches completed
+        # SEQ will prefix the sequence with 0s as needed
+        for i in $(seq -f "%02g" 1 ${GV_BATCHES} ); do
+
+            # Generate the selection id
+            GV_POPSEL="${GV_SELECTION_PREFIX}_${GV_VPDI_CODE}_${i}"
+
+            echo " "
+            echo "--------------------------------------------------------------------------------"
+            echo " "
+            echo " Queuing ${i} of ${GV_BATCHES} for ${COLLEGE} : ${GV_APPLICATION} ${GV_POPSEL} ${GV_CREATOR_ID} ${GV_USER_ID}"
+            echo " "
+
+            # queue the job
+            queueJobSub "${COLLEGE}" "${GV_APPLICATION}" "${GV_POPSEL}" "${GV_CREATOR_ID}" "${GV_USER_ID}"
+
+        done
+
+    done
+
+    echo " "
+    echo "   Total jobs to run: ${#jobsToRun[@]}"
+    echo " "
+
+}
+
+
+#---------------------------------------------------------------------
+#
+#   Schedules all of the CPOS jobs and submits JOBSUBs up to the
+#   setting defined by MAX_PARALLEL and sleeps for specified time
+#   SLEEP_TIME between evaluations to spawn more jobs.
+#
+function doJobScheduling () {
+
+    echo " "
+    echo " Start of Job Scheduling"
+    echo " "
+    echo " Maximum jobs: ${MAX_PARALLEL}"
+    echo " "
+
+    local jobTotal=${#jobsToRun[@]}
+    local jobCntr=0
+    local jobTotalStarted=0
+    local allJobsDone="N"
+    local allPids=""
+    local amountToStart=0
+    local totalRuning=0
+
+    while [[ "${allJobsDone}" == "N" ]]; do
+
+
+        echo "  "`date`" :  Checking job statuses...."
+        
+        amountToStart=0
+        totalRuning=`pgrep -u ${USER} -lf ${CMDFILE} | wc -l` 
+        if [[ ${totalRuning} -lt ${MAX_PARALLEL} ]]; then
+            amountToStart=$((MAX_PARALLEL-totalRuning))
+        fi
+
+        echo "  "`date`" :  Scheduling Status:"
+        echo "                                      Processors Running  : ${totalRuning}"
+        echo "                                      Processors To Start : ${amountToStart}"
+        echo "                                      JobSub Total        : ${jobTotal}"
+        echo "                                      JobSubs Started     : ${jobTotalStarted}"
+        echo "                                      All Jobs Done       : ${allJobsDone}"
+        echo " "
+
+
+        if [[ ${totalRuning} -eq ${MAX_PARALLEL} ]]; then
+           echo "  "`date`" :  All processors running, sleeping ${SLEEP_TIME} till next evaluation..."
+        else
+            if [[ ${amountToStart} -gt 0 ]]; then
+                echo "  "`date`" :  Attempting to start ${amountToStart} more processors..."
+
+                for (( c=1; c<=${amountToStart} && ${jobTotalStarted} < ${jobTotal}; c++ )); do
+                    echo "  "`date`" :  Starting $((jobCntr+1)) of ${jobTotal}"
+
+                    # Start the job
+                    kickOffJob ${jobsToRun[${jobCntr}]}
+                    if [[ $? != "0" ]]; then
+                        echo " "
+                        echo " ERROR Spawning job, continuing to next submission..."
+                        echo " "
+                        ERROR_MISC=Y
+                    fi
+
+                    jobCntr=$((jobCntr + 1 ))
+                    jobTotalStarted=$((jobTotalStarted+1))
+
+                done
+
+
+                if [ "$DEBUG_MODE" = "ON" ] ; then
+                    echo " "
+                    echo "  jobTotalStarted : ${jobTotalStarted}"
+                    echo "  jobTotal        : ${jobTotal}"
+                    echo "  jobCntr         : ${jobCntr}"
+                    echo " "
+                fi
+
+                if [[ ${jobTotalStarted} -eq ${jobTotal} ]]; then
+                    echo " "
+                    echo "  "`date`" :  All jobs started...end of queue loop..."
+                    echo " "
+                    allJobsDone="Y"
+                fi
+
+
+            else
+                echo "  "`date`" :  Unable to queue more jobs due to processors MAX_PARALLEL of ${MAX_PARALLEL} reached..."
+            fi
+
+            #echo " "`date`" :  End of main if..."
+        fi
+
+        if [[ "${allJobsDone}" == "N" ]]; then
+            echo "  "`date`" :  Now sleeping for ${SLEEP_TIME}"
+            sleep ${SLEEP_TIME}
+        fi
+
+    done
+
+
+    # Now that all jobs have been queued, wait until all the recently
+    # started ones have finished. Generate a list of PIDs to search for
+    # and sleep again until all are completed.
+
+    echo " "
+    echo "  Starting monitoring for PID completions..."
+    echo " "
+    allPids=`join_by , ${jobSubPids[@]}`
+    allJobsDone="N"
+
+    if [ "$DEBUG_MODE" = "ON" ] ; then
+        echo "   allPids       : ${allPids}"
+        echo "   allJobsDone   : ${allJobsDone}"
+    fi
+
+    if [[ "${allPids}" != "" ]]; then
+
+        while [[ "${allJobsDone}" != "Y" ]]; do
+            
+            # Us PS command with a list of all pids comma separated and change
+            # format of the command to just have the PID number and count how
+            # many lines are returned.
+            totalRuning=`ps --pid ${allPids} -o pid= | wc -l`
+
+            if [ "$DEBUG_MODE" = "ON" ] ; then
+                echo "  totalRuning : ${totalRuning}"
+            fi
+
+            if [[ ${totalRuning} -eq 0 ]]; then
+                echo "  "`date`" :  Jobs completed. Done with monitoring..."
+                allJobsDone="Y"
+            else
+                echo "  "`date`" :  ${totalRuning} jobs still running..."
+            fi
+
+            if [[ "${allJobsDone}" == "N" ]]; then
+                echo "  "`date`" :  Now sleeping for ${SLEEP_TIME}"
+                sleep ${SLEEP_TIME}
+            fi
+
+        done
+    else
+        echo " "
+        echo "  "`date`" :  No PIDS to monitor. Done with monitoring..."
+        echo " "
+    fi
+
+}
+
+#---------------------------------------------------------------------
+#
+#   Sets the SFASCRE preserve override on any course with a grade 
+#   entered on SFRSTCR (registration table).
+#
+function doPreserveOverrides () {
+
+    if [ "$DEBUG_MODE" = "ON" ] ; then
+        echo "doPreserveOverrides START"
+    fi
+
+    local SQLResult=""
+    local retval=""
+
+    echo " "
+    echo "  Begin preserving overrides checking..."
+    echo " "
+
+    for aCol in ${collegeCtrl[@]}; do
+
+        echo "================================================================================"
+        echo " "
+        echo "   Start of processing for ${aCol}";
+        echo " "
+
+        SQLResult="${LOG_PREFIX}_${aCol^^}.preserveOverrides.log"
+        retval=""
+
+        # Get DB Creds
+        DB_USER=`echo "${aCol}_faload" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+        DB_PASS=`get_creds.sh ${DB_USER} ${ORACLE_SID} ${CREDFILE}`
+
+        if [ "$DEBUG_MODE" = "ON" ] ; then
+            echo " DB_USER              :  ${DB_USER}"
+            echo " DB_PASS              :  --DB_PASS--"
+            echo " "
+        fi
+
+
+sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+SET VERIFY OFF;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+SET LINESIZE 100;
+SET PAGESIZE 0;
+SET SERVEROUT ON;
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 2;
+BEGIN
+  dbms_output.enable(null);
+  sfkscre.p_preserve_overrides( p_vpdi_code => '${aCol^^}' );
+END;
+/
+EXIT;
+DBCMDS
+        retval=$?
+
+        cat  "${SQLResult}"
+
+        if [[ ${retval} != "0" ]]; then
+            echo " "
+            echo " ERROR: Unable to preserve overrides for ${aCol^^}"
+            echo " "
+            echo " "
+            ERROR_MISC=Y
+            return 3
+        fi
+
+    done
+}
+
+
+#----------------------------------------------------------------------------------------------------#
+#                                                                                                    #
+#                                        Main Processing Section                                     #
+#                                                                                                    #
+#----------------------------------------------------------------------------------------------------#
+
+doCleanWorkArea                                                                    >> "${LOG}" 2>> "${ERR}"
+doCheckDB                                                                          >> "${LOG}" 2>> "${ERR}"
+
+if [ "${ERROR_DB_CREDS}" = "N" ] && [ "${ERROR_DB_CONN}" = "N" ] && [ "${ERROR_MISC}" = "N" ] ; then
+
+    doPreserveOverrides                                                            >> "${LOG}" 2>> "${ERR}"
+
+fi
+
+if [ "${ERROR_DB_CREDS}" = "N" ] && [ "${ERROR_DB_CONN}" = "N" ] && [ "${ERROR_MISC}" = "N" ] ; then
+
+    doProcessSetup                                                                 >> "${LOG}" 2>> "${ERR}"
+
+fi
+
+if [ "${ERROR_DB_CREDS}" = "N" ] && [ "${ERROR_DB_CONN}" = "N" ] && [ "${ERROR_MISC}" = "N" ] ; then
+
+    doJobScheduling                                                                >> "${LOG}" 2>> "${ERR}"
+
+fi
+
+echo " "                                                                           >> "${LOG}" 2>> "${ERR}"
+echo "Execution Error Flags:"                                                      >> "${LOG}" 2>> "${ERR}"
+echo "   ERROR_DB_CREDS = ${ERROR_DB_CREDS}"                                       >> "${LOG}" 2>> "${ERR}"
+echo "   ERROR_DB_CONN  = ${ERROR_DB_CONN}"                                        >> "${LOG}" 2>> "${ERR}"
+echo "   ERROR_MISC     = ${ERROR_MISC}"                                           >> "${LOG}" 2>> "${ERR}"
+echo " "                                                                           >> "${LOG}" 2>> "${ERR}"
+
+endTime=`date`
+echo " "                                                                           >> "${LOG}" 2>> "${ERR}"
+echo "${SEPBAR}"                                                                   >> "${LOG}" 2>> "${ERR}"
+echo " "                                                                           >> "${LOG}" 2>> "${ERR}"
+echo "Start Time: ${StartTime}"                                                    >> "${LOG}" 2>> "${ERR}"
+echo "End Time:   ${endTime}"                                                      >> "${LOG}" 2>> "${ERR}"
+
+echo " "
+echo "${SEPBAR}"
+echo " "
+echo "Start Time: ${StartTime}"
+echo "End Time:   ${endTime}"
+echo " "
+
+
+if [ "${DEBUG_MODE}" = "ON" ] ; then
+    echo "${SEPBAR}"
+    echo "-------- LOG ------- File: ${LOG}"
+    if [ -f "${LOG}" ] ; then
+        cat "${LOG}"
+    fi
+    echo "-------- ERR ------- File: ${ERR}"
+    if [ -f "${ERR}" ] ; then
+        cat "${ERR}"
+    fi
+fi

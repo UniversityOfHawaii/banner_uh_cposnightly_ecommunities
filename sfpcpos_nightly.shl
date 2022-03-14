@@ -1,0 +1,105 @@
+#!/bin/bash
+#
+# File:     sfpcpos_nightly.shl
+#
+# Purpose:  Run the CPOS Processor (SFPCPOS) program for for the nightly processing. Based off
+#           the baseline "sfpcpos.shl" script that allows for the processing to move the
+#           logs and list files to the target directories.
+#
+# -------------------------------------------------------------------------------------------------
+#
+#  Usage:   sfpcpos_nightly.shl <ONE_UP>.creds
+#
+#  Where:   ONE_UP     : Oneup number to look for in the SFPCPOS temporary file location for all the
+#                        information to kick off the job. Once it is read, it will remove the file.
+#                        The file contains:
+#
+#                        DB_USER    : DB User
+#                        DB_PASS    : DB pass
+#                        FILE_PATH  : Where to output the LIS file
+#                        TARGET_LIS : What to rename the output LIS file to
+#                        TARGET_LOG : Where to output the LOG file
+#                        LOG4J_PATH : Where to output the log4j statements
+#
+#--------------------------------------------------------------------------------------------------
+#
+# Audit Log 1.0
+#
+#    1. Initial release of the script.                                              KAH 24-APR-2020
+#    2. Added file checks.                                                              29-APR-2020
+#    3. Added debugging statements.
+#    4. Added test cases where script will just generated log and lis files with a random sleep
+#       amount to simulate processing time.
+#    5. Adding dynamically enabling log4j.                                              07-MAY-2020
+#    6. Encased all debug commands within quotes.
+#    7. Removed reference to UH modified version of JAR file, reverted to baseline.     28-DEC-2020
+#
+# Audit Log End
+#
+# -------------------------------------------------------------------------------------------------
+#
+
+
+FILE_CREDS="${TEMPHOME}/${1}.creds"
+
+if [[ "${TEMPHOME}" == "" ]]; then
+    echo " "
+    echo " ERROR: TEMPHOME not defined"
+    echo " "
+    exit 4
+fi
+
+if [[ ! -f "${FILE_CREDS}" ]]; then
+    echo " "
+    echo " ERROR: Credential file not found:"
+    echo "        ${FILE_CREDS}"
+    echo " "
+    exit 3
+fi
+
+# Load the jobsub details
+. "${TEMPHOME}/${1}.creds"
+
+
+# Load Banner Java environment variables
+. banjavaenv.shl
+
+#
+# SFPCPOS Static Java Commands
+#
+#CP="$BANNER_HOME/uhmods/student/java/sfpcpos.jar:\   # UH:1.0:7
+CP="$BANNER_HOME/student/java/sfpcpos.jar:\
+$BANNER_HOME/general/java/gurjbif.jar:\
+$BANNER_HOME/general/java/transporter.jar:\
+$BANNER_PROD_HOME/student/java/sfpcpos.jar:\
+$BANNER_PROD_HOME/general/java/gurjbif.jar:\
+$BANNER_PROD_HOME/general/java/transporter.jar:\
+$BAN_CLASSPATH_SUFFIX"
+
+PROCESSOR="-Dbatch.processor.class=net.hedtech.banner.student.registration.DegreeAuditProcessor"
+OUTPUTDIR="-Dfile.path=${FILE_PATH}"
+
+# Dynamically enable or disable LOG4J
+if [[ "${LOG4J_PATH}" != "NOLOG4J" ]]; then
+    LOG4J_CONFIG="-Dlog4j.configuration=file:${BANNER_LINKS}/sfpcpos_nightly_log4j.properties"
+    LOG4J_OUTPUT="-Dlog4jFile.name=${LOG4J_PATH}"    
+
+    echo " JOB VALUES:"
+    echo "    CP              : ${CP}"
+    echo "    FILE_CREDS      : ${FILE_CREDS}"
+    echo "    FILE_PATH       : ${FILE_PATH}"
+    echo "    JDBC_CONNECTION : ${JDBC_CONNECTION}"
+    echo "    JOB_USER        : ${JOB_USER}"
+    echo "    ONE_UP          : ${ONE_UP}"
+    echo "    OUTPUTDIR       : ${OUTPUTDIR}"
+    echo "    PROCESSOR       : ${PROCESSOR}"
+    echo "    LOG4J_CONFIG    : ${LOG4J_CONFIG}"
+    echo "    LOG4J_OUTPUT    : ${LOG4J_OUTPUT}"
+fi
+
+# Dynamically call Java process with or without log4j enabled
+if [[ "${LOG4J_PATH}" != "NOLOG4J" ]]; then
+echo ${JOB_PASS} | java -Xms64m -Xmx1024m ${PROCESSOR} ${OUTPUTDIR} ${LOG4J_OUTPUT} ${LOG4J_CONFIG} -classpath ${CP} com.sct.messaging.bif.banner.BannerBatchProcessor ${JOB_USER} ${JDBC_CONNECTION} ${ONE_UP}  SFPCPOS | tee ${FILE_PATH}/sfpcpos_${ONE_UP}.log 2>&1
+else
+echo ${JOB_PASS} | java -Xms64m -Xmx1024m ${PROCESSOR} ${OUTPUTDIR} -classpath ${CP} com.sct.messaging.bif.banner.BannerBatchProcessor ${JOB_USER} ${JDBC_CONNECTION} ${ONE_UP}  SFPCPOS | tee  ${FILE_PATH}/sfpcpos_${ONE_UP}.log 2>&1
+fi

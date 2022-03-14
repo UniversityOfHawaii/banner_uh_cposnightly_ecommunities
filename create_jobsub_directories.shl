@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+#  Create JOBSUB directories for CPOS nightly processing
+#
+#  NOTES:  1. Directories needs to be owned by the OS user responsible for running JOBSUBs.
+#          2. Assumes that it a MEPed environment, generates folder per MEP.
+#          3. OS security is applied at the finaid/<mepXX> folder; already assigned to
+#             the institutions OS security group.
+#
+# Installs all folders and assign permissions
+#
+#
+if [[ "${USER}" == "job${ORACLE_SID}" ]]; then
+    echo " "
+    echo " Creating AUTOMATED JOBSUB directories..."
+    echo " "
+#
+    AUTODIR="${JOB_HOME}/automated/sfpcpos"
+    mkdir -v "${AUTODIR}"
+    mkdir -vp "${AUTODIR}/logs"
+    mkdir -vp "${AUTODIR}/temp"
+    chmod -vp 750 "${AUTODIR}/temp" 
+#
+    echo " "
+    echo " Creating FINAID JOBSUB directories..."
+    echo " "
+#
+    mkdir -vp "${JOB_HOME}/finaid/mep01/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep02/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep03/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep04/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep05/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep06/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep07/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep08/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep09/sfpcpos"
+    mkdir -vp "${JOB_HOME}/finaid/mep10/sfpcpos"
+#
+    echo " "
+    echo " Done creating directories..."
+    echo " "
+#
+else
+    echo " "
+    echo " ERROR: Only the JOB<SID> user can use this script due to OS permission requirements"
+    echo " "
+fi

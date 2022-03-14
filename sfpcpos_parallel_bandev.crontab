@@ -1,0 +1,29 @@
+# -------------------------------------------------------------------------------------------------
+#
+#     THIS SECTION SHOULD ONLY BE DEFINED ONCE IN THE USERS CRON TAB
+#
+#
+#  Define common variables. Need to hard code on RIGHT side of equal sign,
+#  cron will not expand/substitute variables. If already defined from above,
+#  make sure they are the same, if not, need to modify. Add variables if
+#  needed.
+#
+# FIRST ENTRIES OF THE CRON TAB SHOULD INCLUDE:
+#
+BATCHSID="sid"
+BATCHHOME="/codetree/bsid/uh"
+BATCHLOG="/jobsub/sid/automated"
+#
+# >>> COPY START <<<<
+# -------------------------------------------------------------------------------------------------
+# SFPCPOS College Program of Study START
+#
+# All Institutions Processing:
+#    10:00 PM every Sunday through Friday
+#
+0 20 * * 0-5 /bin/bash ${BATCHHOME}/bin/run_sfpcpos_parallel.shl ${BATCHSID} sfpcpos_controls_all.cfg > ${BATCHLOG}/sfpcpos/sfpcpos_parallel_all.log 2>&1
+#
+# SFPCPOS College Program of Study END
+# -------------------------------------------------------------------------------------------------
+# >>> COPY END <<<<
+#

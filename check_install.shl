@@ -1,0 +1,310 @@
+#!/bin/bash
+SHELL=/bin/bash
+#-------------------------------------------------------------------------------------------------- 
+#
+# File Name:   check_install.shl 
+# Created:     07-MAY-2020
+#
+#--------------------------------------------------------------------------------------------------
+#
+# Purpose:     Checks for required files for processing after installation.
+#
+# Notes:       1.  Assumes that this is a MEPed install for 10 MEPs.
+#              2.  Environment variable $UH_HOME is where we put all of our custom code. Update
+#                  to where your institution stores code.
+#
+# Usage:       Run by hand as BAT<SID>:
+#              bash check_install.shl <database>
+#
+#--------------------------------------------------------------------------------------------------
+#
+# Audit Log 1.0
+#       
+#   1. Initial release of the script.                                               KAH 01-MAY-2020
+#
+# END Audit Log 1.0
+#
+#--------------------------------------------------------------------------------------------------
+
+# Edit as needed for your institution
+mepCodes="mep01 mep02 mep03 mep04 mep05 mep06 mep07 mep08 mep09 mep10"
+
+echo " "
+echo " ======================================================="
+echo "                 Checking Install"
+echo " "
+
+# Check to make sure one arguments is passed into the program.
+if [ $# != 1 ] ; then
+  echo " "
+  echo " ERROR: Only ORACLE_SID argument should be passed into program"
+  echo " "
+  exit 1
+fi
+
+#--------------------------------------------------------------------------------------------------
+
+#
+# Validate the sid, only continue processing if the sid is found
+# in the /etc/oratab table. Only production environment is capitalized,
+# all others are lower case.
+#
+valid_sid_found=0
+#  Is it a valid SID?
+tmpsid=`grep "^${1}:" /etc/oratab`
+if [[ "${tmpsid}" == "" ]] ; then
+    valid_sid_found=0
+else
+    valid_sid_found=1
+fi
+
+if [[ "${valid_sid_found}" == "0" ]] ; then
+    echo " "
+    echo " ERROR: Invalid SID given: -${1}-"
+    echo " "
+    Usage
+    exit 1
+else
+    echo " Valid SID given"
+fi
+
+ORACLE_SID_LOWER=`echo "${ORACLE_SID}" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+
+ERROR_DIR_CHECK="N"
+ERROR_FILE_CHECK="N"
+ERROR_GROUP_CHECK="N"
+ERROR_WRITE_FILE="N"
+ERROR_DB_CONN="N"
+
+#--------------------------------------------------------------------------------------------------
+
+check_directory()
+{
+    if [[ -d "${1}" ]]; then
+        echo "Directory Check ==>  PASS  : -${1}-"
+    else
+        echo "Directory Check ==>  ERROR : Directory does not exist: -${1}-"
+        ERROR_DIR_CHECK="Y"
+    fi
+}
+
+check_file()
+{
+    if [[ -f "${1}" ]]; then
+        echo "File Check     ==>  PASS  : -${1}-"
+    else
+        echo "File Check     ==>  ERROR : File does not exist: -${1}-"
+        ERROR_FILE_CHECK="Y"
+    fi
+}
+
+check_group()
+{
+    cnt=`grep "^${1}\W" /etc/group | wc -l`
+    if [ ${cnt} -eq 1 ]; then
+        echo "Group Check     ==>  PASS  : -${1}-"
+    else
+        echo "Group Check     ==>  ERROR : Group does not exist: -${1}-"
+        ERROR_GROUP_CHECK="Y"
+    fi
+}
+
+write_file()
+{
+    local tstfile="${1}/write_test.txt"
+    if [[ -d "${1}" ]]; then
+
+        echo "test" > "${tstfile}"
+        if [[ -f "${tstfile}" ]]; then
+        echo "Write File      ==>  PASS  : -${1}-"
+            rm "${tstfile}"
+        else
+        echo "Write File      ==>  ERROR : Unable to write to file at -${1}-"
+            ERROR_WRITE_FILE="Y"
+        fi
+        
+    else
+        echo "Write File      ==>  ERROR : Unable to write to file at -${1}-"
+        ERROR_WRITE_FILE="Y"
+    fi
+}
+
+function doCheckDB()
+{
+    echo "Checking for all database user credentials"
+    local DB_USER
+    local DB_PASS
+    local errorText
+    local TestConnection
+    local plsqlstring
+    local SQLResult
+
+
+    for aCol in ${mepCodes} ; do
+
+        # Replace pattern for your colleges oracle accounts.
+        #DB_USER=`echo "CPOS_${aCol}" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+        DB_USER=`echo "${aCol}_faload" | /usr/bin/tr '[:upper:]' '[:lower:]'`
+
+        # get credentials - UH tool that we have in place, rework this line as neede for your institution
+        DB_PASS=`get_creds.sh ${DB_USER} ${ORACLE_SID} ${PWCONFIG}`
+
+        if [ "${DB_PASS}" = "" ]; then
+            echo "     ${aCol}/${DB_USER} -- FAIL - Password not found for user ${DB_USER} in ${ORACLE_SID}. Contact a DBA for account credentials."
+            ERROR_DB_CONN="Y"
+            continue
+        fi
+
+
+        #
+        # Check if database is up and can log in using last user obtained
+        #
+        TestConnection="NOTUP"
+        SQLResult="${CVJOBHOMEAUTOMATED}/dbtestresult_${aCol}.out"
+        sqlplus -s /nolog > "${SQLResult}" <<DBCMDS
+CONNECT ${DB_USER}/${DB_PASS}
+SET VERIFY OFF;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+SET LINESIZE 100;
+SET PAGESIZE 0;
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 2;
+SELECT 'connection_established' FROM dual;
+EXIT;
+DBCMDS
+
+        TestConnection=`cat "${SQLResult}"`
+
+
+        if [[ "${TestConnection}" != "connection_established" ]] ; then
+          
+          echo "     ${aCol}/${DB_USER} -- FAIL - Invalid database credentials"
+          ERROR_DB_CONN="Y"
+          continue
+        fi
+
+        echo "     ${aCol}/${DB_USER} -- PASS" 
+
+    done
+
+
+}
+
+#++++++++++++++++++++++++++++++++++++ Installation Checks +++++++++++++++++++++++++++++++++++++++++
+
+
+#
+# Set a minimum path so that we can do setsid
+#
+echo " Doing SETSID to ${1}"
+ORACLE_BASE=/oracle
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+PATH=$ORACLE_BASE/lbin:$PATH
+export PATH
+#
+# Setsid to first variable
+#
+. setsid "${1}"
+
+#--------------------------------------------------------------------------------------------------
+
+#
+# Re-define path to include the project bin directory. This is due to SETSID completely
+# clobbers the PATH.
+#
+CVHOMDIR="${UH_HOME}"
+CVBINDIR="${CVHOMDIR}/bin"
+
+# Define directories and files names for the program and subscripts to utilize.
+
+# Config file locations
+CVCONFIG_DIR="${CVHOMDIR}/etc"
+PWCONFIG="${CVCONFIG_DIR}/pw.conf"
+
+#  Processing Folder Locations
+CVJOBHOMEAUTOMATED="${JOB_HOME}/automated/sfpcpos"
+CVFAHOME="${JOB_HOME}/finaid"
+
+
+
+#  SQL File Names
+
+
+#--------------------------------------------------------------------------------------------------
+#
+#  Group checks
+#
+echo " "
+echo " ======================================================="
+echo "                 OS Group Check"
+echo " "
+#check_group cpos
+#check_group cposadm
+echo "     NONE TO DO "
+echo " "
+
+#--------------------------------------------------------------------------------------------------
+#
+#  Directory checks
+#
+echo " "
+echo " ======================================================="
+echo "                 Directory Checks"
+echo " "
+check_directory "${CVJOBHOMEAUTOMATED}"
+check_directory "${CVJOBHOMEAUTOMATED}/logs"
+check_directory "${CVHOMDIR}"
+check_directory "${CVBINDIR}"
+check_directory "${CVFAHOME}"
+for aCol in ${mepCodes} ; do
+check_directory "${CVFAHOME}/${aCol}/sfpcpos"
+done
+
+#--------------------------------------------------------------------------------------------------
+#
+#  Write file checks
+#
+echo " "
+echo " ======================================================="
+echo "                 Write File Checks"
+echo " "
+write_file "${CVJOBHOMEAUTOMATED}"
+write_file "${CVJOBHOMEAUTOMATED}/logs"
+for aCol in ${mepCodes} ; do
+write_file "${CVFAHOME}/${aCol}/sfpcpos"
+done
+
+#--------------------------------------------------------------------------------------------------
+#
+#  File checks
+#
+echo " "
+echo " ======================================================="
+echo "                 Configuration Checks"
+echo " "
+check_file "${PWCONFIG}"
+check_file "${CVCONFIG_DIR}/sfpcpos_controls_all.cfg"
+check_file "${CVCONFIG_DIR}/sfpcpos_controls_mep01.cfg"
+check_file "${CVCONFIG_DIR}/sfpcpos_controls_test.cfg"
+check_file "${CVCONFIG_DIR}/sfpcpos_parallel_${ORACLE_SID_LOWER}.crontab"
+
+#--------------------------------------------------------------------------------------------------
+#
+#  DB checks
+#
+echo " "
+echo " ======================================================="
+echo "                 Database Checks"
+echo " "
+doCheckDB
+
+if [[ "${ERROR_DIR_CHECK}" == "N" && "${ERROR_FILE_CHECK}" == "N" && "${ERROR_GROUP_CHECK}" == "N" && "${ERROR_DB_CONN}" == "N" ]]; then
+    echo " "
+    echo "   All checks passed..."
+    echo " "
+else
+    echo " "
+    echo "   Review errors encountered..."
+    echo " "
+fi
