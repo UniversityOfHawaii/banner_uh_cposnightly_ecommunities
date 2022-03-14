@@ -20,7 +20,7 @@ NOTES:
           some tweaks. Mainly, we use many LOOPs to process each MEP code.
      3.   The concept of shell variable $UH_HOME is the directory where all of our custom code and 
           processes reside, with a folder housing a project/process files. This helps keep UH code 
-          out of Banner code. Ex:
+          out of baseline Banner code. Ex:
 
               $UH_HOME =  /u01/uhmods/
 
@@ -28,7 +28,7 @@ NOTES:
               $UH_HOME/etc
               $UH_HOME/sfpcpos_nightly
 
-     4.   Modifications were also done to the SFKSCRE package. Shorted, abbreviated versions of the 
+     4.   Modifications were also done to the SFKSCRE package. A shorted, abbreviated versions of the 
           package header and body are included. This includes a few logic changes, logic on how to 
           load students into the different popsels, and how to preserve overrides when a grade has 
           been rolled but may not count towards a students program.
@@ -38,8 +38,8 @@ HOW TO INSTALL:
 
      BASH Files:
 
-          Place the following executable scripts into its project folder:
-          EX *$UH_HOME/sfpcpos_nightly*:
+          Place the following executable scripts into its project folder. EX:
+               $UH_HOME/sfpcpos_nightly:
 
           run_sfpcpos_parallel.shl           - Main script that runs the entire process
 
@@ -56,7 +56,7 @@ HOW TO INSTALL:
 
           check_install.shl                  - Run after create_jobsub_directories.shl which
                                                verifies structure, permissions, and files are
-                                               in the right location. Modify as needed.
+                                               in the right location.
 
           Place the following in your $BANNER_HOME custom directory. This folder is the root 
           directory that UH uses to hold all the customization that have been done to the system. 
@@ -64,6 +64,7 @@ HOW TO INSTALL:
           EX:
               $BANNER_HOME/student/misc            <---- Baseline file
               $BANNER_HOME/uhmods/student/misc/    <---- UH Modified version
+          
           Then re-link the file from the custom folder to $BANNER_LINKS.
 
           sfpcpos_nightly.shl                - Modified version of the sfpcpos.shl file that takes
@@ -141,7 +142,7 @@ HOW TO CONFIGURE:
 
      Database Configuration: sfkscre.sql
 
-          UH_MAX_POPSEL_BATCHES:  Max amount of batches per allowed.
+          UH_MAX_POPSEL_BATCHES:  Max amount of batches allowed per institution.
 
 HOW TO RUN:
 
